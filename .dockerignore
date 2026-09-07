@@ -1,0 +1,23 @@
+node_modules
+dist
+taobao-session.json
+mcp-auth-token.txt
+.env
+.git
+
+# browser-profile IS included in the build context (baked into the image —
+# see Dockerfile) since that's the actual logged-in session now. Only the
+# regenerable, session-irrelevant caches inside it are excluded, to keep
+# the image smaller — Chromium rebuilds these on first use with zero effect
+# on auth. The Singleton* files are OS-level lock artifacts from whatever
+# local process last had the profile open; stale ones can make Chromium
+# think it's already running.
+browser-profile/Default/Cache
+browser-profile/Default/Code Cache
+browser-profile/Default/GPUCache
+browser-profile/GraphiteDawnCache
+browser-profile/BrowserMetrics-spare.pma
+browser-profile/SingletonLock
+browser-profile/SingletonSocket
+browser-profile/SingletonCookie
+browser-profile/RunningChromeVersion

@@ -1,0 +1,32 @@
+{
+  "name": "taobao-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP server for automating Taobao (web) shopping via Playwright: login, search, cart, checkout",
+  "main": "dist/server.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc && playwright install --with-deps chromium",
+    "build:ts": "tsc",
+    "start": "node dist/httpServer.js",
+    "start:stdio": "node dist/server.js",
+    "dev": "tsc && node dist/httpServer.js"
+  },
+  "keywords": [
+    "mcp",
+    "taobao",
+    "automation",
+    "playwright"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "dotenv": "^17.2.3",
+    "express": "^5.2.1",
+    "playwright": "^1.63.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}

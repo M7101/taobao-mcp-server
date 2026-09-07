@@ -1,0 +1,12 @@
+node_modules/
+dist/
+taobao-session.json
+browser-profile/
+mcp-auth-token.txt
+.env
+.env.*
+storageState*.json
+*.jpg
+*.jpeg
+*.png
+debug-*.json
