@@ -1,15 +1,10 @@
 import { Router, type Request, type Response } from "express";
 import { createHash, randomBytes, randomUUID } from "crypto";
 
-// Minimal single-user OAuth 2.1 + PKCE shim, just enough to satisfy the MCP
-// Authorization spec that claude.ai's remote-connector UI actually speaks.
-// That UI has no field for pasting a static bearer token — on seeing any 401
-// from /mcp it always tries to run an OAuth authorization_code flow, and
-// fails immediately ("无法启动mcp授权") if the server doesn't expose the
-// discovery/register/authorize/token endpoints below. The one real gate is
-// the password prompt in /authorize: only whoever knows `secret` (the same
-// value that used to be pasted as a raw bearer token) can ever complete the
-// flow and mint themselves a fresh, revocable access token.
+// Minimal single-user OAuth 2.1 + PKCE shim for remote MCP clients.
+// The authorization password remains the human gate, but client IDs and
+// redirect URIs are also bound and checked so an authorize request cannot
+// silently invent a new client or swap the callback destination.
 const CODE_TTL_MS = 5 * 60 * 1000;
 const ACCESS_TOKEN_TTL_MS = 60 * 60 * 1000;
 const REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -25,6 +20,7 @@ interface AuthCodeRecord {
   expiresAt: number;
 }
 interface TokenRecord {
+  clientId: string;
   expiresAt: number;
 }
 
@@ -37,6 +33,17 @@ function pkceMatches(verifier: string, challenge: string, method: string): boole
   const hash = createHash("sha256").update(verifier).digest();
   const b64url = hash.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   return b64url === challenge;
+}
+
+function isAllowedRedirectUri(value: string): boolean {
+  try {
+    const url = new URL(value);
+    if (url.protocol === "https:") return true;
+    if (url.protocol !== "http:") return false;
+    return url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]";
+  } catch {
+    return false;
+  }
 }
 
 export function createOAuthShim(opts: { secret: string; publicBaseUrl: string }) {
@@ -55,6 +62,11 @@ export function createOAuthShim(opts: { secret: string; publicBaseUrl: string })
       return false;
     }
     return true;
+  }
+
+  function clientAllowsRedirect(clientId: string, redirectUri: string): boolean {
+    const client = clients.get(clientId);
+    return !!client && client.redirectUris.includes(redirectUri);
   }
 
   function renderAuthorizeForm(params: Record<string, string>, error?: string): string {
@@ -106,13 +118,23 @@ ${error ? `<p class="err">${escapeHtml(error)}</p>` : ""}
   });
 
   router.post("/register", (req: Request, res: Response) => {
-    const redirectUris: string[] = Array.isArray(req.body?.redirect_uris) ? req.body.redirect_uris : [];
+    const redirectUris: string[] = Array.isArray(req.body?.redirect_uris)
+      ? req.body.redirect_uris.map(String)
+      : [];
+    if (redirectUris.length === 0 || redirectUris.some((uri) => !isAllowedRedirectUri(uri))) {
+      res.status(400).json({
+        error: "invalid_redirect_uri",
+        error_description: "At least one HTTPS redirect URI (or localhost HTTP URI) is required.",
+      });
+      return;
+    }
+
     const clientId = randomUUID();
-    clients.set(clientId, { redirectUris });
+    clients.set(clientId, { redirectUris: [...new Set(redirectUris)] });
     res.status(201).json({
       client_id: clientId,
       client_id_issued_at: Math.floor(Date.now() / 1000),
-      redirect_uris: redirectUris,
+      redirect_uris: [...new Set(redirectUris)],
       token_endpoint_auth_method: "none",
       grant_types: ["authorization_code", "refresh_token"],
       response_types: ["code"],
@@ -132,12 +154,13 @@ ${error ? `<p class="err">${escapeHtml(error)}</p>` : ""}
       res.status(400).send("Missing required OAuth parameters");
       return;
     }
-    // Auto-register unknown client ids on first sight — DCR is technically
-    // required first, but some clients call /authorize directly; trusting
-    // the redirect_uri they present here is fine since the real gate is the
-    // password prompt below, not client/redirect allow-listing.
-    if (!clients.has(params.client_id)) {
-      clients.set(params.client_id, { redirectUris: [params.redirect_uri] });
+    if (params.code_challenge_method !== "S256") {
+      res.status(400).send("Only PKCE S256 is supported");
+      return;
+    }
+    if (!clientAllowsRedirect(params.client_id, params.redirect_uri)) {
+      res.status(400).send("Unknown client_id or unregistered redirect_uri");
+      return;
     }
     res.set("Content-Type", "text/html; charset=utf-8").send(renderAuthorizeForm(params));
   });
@@ -151,6 +174,11 @@ ${error ? `<p class="err">${escapeHtml(error)}</p>` : ""}
       code_challenge_method: String(req.body?.code_challenge_method ?? "S256"),
       scope: String(req.body?.scope ?? ""),
     };
+    if (!clientAllowsRedirect(params.client_id, params.redirect_uri) || params.code_challenge_method !== "S256") {
+      res.status(400).send("Invalid OAuth client, redirect URI, or PKCE method");
+      return;
+    }
+
     const password = String(req.body?.password ?? "");
     if (password !== secret) {
       res.status(401).set("Content-Type", "text/html; charset=utf-8").send(renderAuthorizeForm(params, "密码错误，请重试"));
@@ -175,20 +203,32 @@ ${error ? `<p class="err">${escapeHtml(error)}</p>` : ""}
     if (grantType === "authorization_code") {
       const code = String(req.body?.code ?? "");
       const codeVerifier = String(req.body?.code_verifier ?? "");
+      const clientId = String(req.body?.client_id ?? "");
+      const redirectUri = String(req.body?.redirect_uri ?? "");
       const record = codes.get(code);
       if (!record || record.expiresAt < Date.now()) {
         res.status(400).json({ error: "invalid_grant" });
         return;
       }
+      // Consume the code once it reaches the token endpoint. Even a failed
+      // validation must not leave a reusable authorization code behind.
       codes.delete(code);
+      if (!clientId || clientId !== record.clientId) {
+        res.status(400).json({ error: "invalid_grant", error_description: "client_id mismatch" });
+        return;
+      }
+      if (redirectUri && redirectUri !== record.redirectUri) {
+        res.status(400).json({ error: "invalid_grant", error_description: "redirect_uri mismatch" });
+        return;
+      }
       if (!pkceMatches(codeVerifier, record.codeChallenge, record.codeChallengeMethod)) {
         res.status(400).json({ error: "invalid_grant", error_description: "PKCE verification failed" });
         return;
       }
       const accessToken = randomBytes(32).toString("hex");
       const refreshToken = randomBytes(32).toString("hex");
-      accessTokens.set(accessToken, { expiresAt: Date.now() + ACCESS_TOKEN_TTL_MS });
-      refreshTokens.set(refreshToken, { expiresAt: Date.now() + REFRESH_TOKEN_TTL_MS });
+      accessTokens.set(accessToken, { clientId: record.clientId, expiresAt: Date.now() + ACCESS_TOKEN_TTL_MS });
+      refreshTokens.set(refreshToken, { clientId: record.clientId, expiresAt: Date.now() + REFRESH_TOKEN_TTL_MS });
       res.json({
         access_token: accessToken,
         token_type: "Bearer",
@@ -199,13 +239,18 @@ ${error ? `<p class="err">${escapeHtml(error)}</p>` : ""}
     }
     if (grantType === "refresh_token") {
       const refreshToken = String(req.body?.refresh_token ?? "");
+      const clientId = String(req.body?.client_id ?? "");
       const record = refreshTokens.get(refreshToken);
       if (!record || record.expiresAt < Date.now()) {
         res.status(400).json({ error: "invalid_grant" });
         return;
       }
+      if (clientId && clientId !== record.clientId) {
+        res.status(400).json({ error: "invalid_grant", error_description: "client_id mismatch" });
+        return;
+      }
       const accessToken = randomBytes(32).toString("hex");
-      accessTokens.set(accessToken, { expiresAt: Date.now() + ACCESS_TOKEN_TTL_MS });
+      accessTokens.set(accessToken, { clientId: record.clientId, expiresAt: Date.now() + ACCESS_TOKEN_TTL_MS });
       res.json({
         access_token: accessToken,
         token_type: "Bearer",
