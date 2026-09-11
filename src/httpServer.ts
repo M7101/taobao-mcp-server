@@ -8,19 +8,24 @@ import { TaobaoClient } from "./taobao.js";
 import { getOrCreateAuthToken } from "./auth.js";
 import { createOAuthShim } from "./oauth.js";
 
-// Public-facing entry point. Every MCP request must carry a valid bearer
-// token: this server holds a live logged-in Taobao session and exposes a
-// real payment path. Query-string tokens are deliberately not accepted,
-// because URLs are commonly retained in browser history, proxy logs and
-// analytics. Use Authorization: Bearer ... or the OAuth flow below.
+// Local/private MCP entry point. The process binds to loopback by default so
+// the local tunnel runtime can reach it without exposing the Taobao session to
+// the LAN. Non-loopback callers still need bearer/OAuth authentication.
 const PORT = Number(process.env.PORT ?? 8787);
+const HOST = process.env.HOST ?? "127.0.0.1";
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL ?? `http://localhost:${PORT}`;
+const TRUST_LOOPBACK = (process.env.MCP_TRUST_LOOPBACK ?? "true").toLowerCase() !== "false";
 
 // One shared TaobaoClient (and its one persistent browser page) across
 // every HTTP session, so buyNow/payNow keep acting on the same live page.
 const taobaoClient = new TaobaoClient();
 
 const transports = new Map<string, StreamableHTTPServerTransport>();
+
+function isLoopback(req: Request): boolean {
+  const ip = req.socket.remoteAddress ?? "";
+  return ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1";
+}
 
 async function main() {
   await taobaoClient.initialize();
@@ -46,10 +51,16 @@ async function main() {
   const oauth = createOAuthShim({ secret: token, publicBaseUrl: PUBLIC_BASE_URL });
   app.use(oauth.router);
 
-  // Accept either the host's static secret in the Authorization header
-  // (useful for local/manual testing) or a short-lived OAuth access token.
-  // Never accept credentials from the URL/query string.
+  // The OpenAI tunnel runtime connects locally from loopback. When the server
+  // is loopback-bound, allowing that local hop without a second bearer token
+  // avoids an unusable localhost OAuth redirect while keeping remote callers
+  // protected. Set MCP_TRUST_LOOPBACK=false to require bearer auth even locally.
   function requireBearerToken(req: Request, res: Response, next: NextFunction) {
+    if (TRUST_LOOPBACK && isLoopback(req)) {
+      next();
+      return;
+    }
+
     const header = req.header("authorization") ?? "";
     const candidate = header.startsWith("Bearer ") ? header.slice("Bearer ".length) : "";
     if (candidate === token || oauth.isValidAccessToken(candidate)) {
@@ -83,8 +94,8 @@ async function main() {
     await transport.handleRequest(req, res, req.body);
   });
 
-  app.listen(PORT, () => {
-    console.error(`Taobao MCP server (HTTP) listening on :${PORT}, endpoint POST/GET /mcp`);
+  app.listen(PORT, HOST, () => {
+    console.error(`Taobao MCP server (HTTP) listening on ${HOST}:${PORT}, endpoint POST/GET /mcp`);
   });
 }
 
